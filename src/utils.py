@@ -43,8 +43,6 @@ import statsmodels.formula.api as smf
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools.tools import add_constant
 
-from arch.bootstrap import StationaryBootstrap
-
 from scipy import stats
 from scipy.stats import pearsonr, spearmanr, f_oneway
 from scipy.stats.mstats import winsorize
@@ -67,11 +65,6 @@ pd.set_option('display.max_columns', None)
 # plt.style.use('seaborn-v0_8')
 # sns.set_palette("husl")
 
-def clean_mem():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    time.sleep(0.1)
 
 def grid_search_cv(param_grid, model, X_train_scaled, y_train, X_test_scaled, y_test):
 
@@ -326,6 +319,138 @@ class color:
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
     END = '\033[0m'
+
+def ols_with_cluster(data, target, x_vars, cluster_var):
+
+    subset = data.dropna(subset=[target] + x_vars + [cluster_var])
+    X = add_constant(subset[x_vars])
+    y = subset[target]
+    clusters = subset[cluster_var]
+    
+    model = OLS(y, X).fit()
+
+    results = model.get_robustcov_results(cov_type='cluster', groups=clusters)
+    return results
+
+
+def ols_new_west(data, x_vars, target):
+    subset = data.dropna(subset=[target] + x_vars)
+    
+    formula = f"{target} ~ {' + '.join(x_vars)}"
+    
+    model = smf.ols(formula, data=subset)
+    results = model.fit(cov_type='HAC', cov_kwds={'maxlags': 12})
+    
+    return results
+
+
+def fit_one_factor(df, sentiment, return_names, control_variables=None):
+    features_res = {}
+    
+    for target in return_names:
+        if control_variables is not None:
+            results = ols_new_west(df, [sentiment] + control_variables, target)
+        else:
+            results = ols_new_west(df, [sentiment], target)
+        features_res[target] = {}
+        features_res[target]['model'] = results
+        features_res[target]['coef'] = round(results.params[sentiment], 3)
+        features_res[target]['t'] = round(results.tvalues[sentiment], 3)
+        features_res[target]['r2_adj'] = round(100*results.rsquared_adj, 3)
+        
+        pval = round(results.pvalues[sentiment], 3)
+        
+        features_res[target]['pval'] = pval
+        if pval <= 0.01:
+            sgnf = '***'
+        elif 0.01 < pval <= 0.05:
+            sgnf = '**'
+        elif 0.05 < pval <= 0.1:
+            sgnf = '*'
+        else:
+            sgnf = ''
+        features_res[target]['sgnf'] = sgnf
+        
+    table_res = pd.DataFrame(features_res).T.drop('model', axis=1)
+    table_res['coef'] = table_res['coef'].astype(str) + table_res['sgnf']
+    table_res = table_res[['coef', 't', 'r2_adj', 'pval']]
+        
+    return features_res, table_res
+
+def plot_prediction_for_different_risks(df, 
+                                        model_results,
+                                        x_vars,
+                                        risk_col,
+                                        polarity_values=np.linspace(-1.4, 1.4, 100),
+                                        risk_name='VIX',
+                                        xlabel='Polarity Growth Llama Norm',
+                                        ylabel='Predicted Net Cumulative Return (12 months)'
+                                       ):
+
+    q10 = np.percentile(df[risk_col], q=10).item()
+    q50 = np.percentile(df[risk_col], q=50).item()
+    q90 = np.percentile(df[risk_col], q=90).item()
+
+    data_q10 = pd.DataFrame([polarity_values, [q10]*100, polarity_values * q10]).T
+    data_q10.columns = x_vars
+    data_q50 = pd.DataFrame([polarity_values, [q50]*100, polarity_values * q50]).T
+    data_q50.columns = x_vars
+    data_q90 = pd.DataFrame([polarity_values, [q90]*100, polarity_values * q90]).T
+    data_q90.columns = x_vars
+                            
+    # data_q50 = pd.DataFrame({
+    #     'polarity_growth_llama_norm': polarity_values,
+    #     'vix_norm': q50,
+    #     'sent_vix': polarity_values * q50
+    # })
+    
+    # data_q90 = pd.DataFrame({
+    #     'polarity_growth_llama_norm': polarity_values,
+    #     'vix_norm': q90,
+    #     'sent_vix': polarity_values * q90
+    # })
+    
+    pred_q10 = model_results.predict(data_q10)
+    pred_q50 = model_results.predict(data_q50)
+    pred_q90 = model_results.predict(data_q90)
+    
+    
+    plt.figure(figsize=(10, 6))
+    
+    plt.plot(polarity_values, pred_q10, label=f'{risk_name} = {q10:.3f} (10th percentile)', linewidth=2)
+    plt.plot(polarity_values, pred_q50, label=f'{risk_name} = {q50:.3f} (50th percentile)', linewidth=2)
+    plt.plot(polarity_values, pred_q90, label=f'{risk_name} = {q90:.3f} (90th percentile)', linewidth=2)
+    
+    plt.xlabel(xlabel, fontsize=12)
+    plt.ylabel(ylabel, fontsize=12)
+    plt.title(f'Marginal Effect of Sentiment on Returns at Different {risk_name} Levels', fontsize=14)
+    plt.legend(fontsize=10)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    plt.show()
+
+def plot_time_series(df, dates, cols_to_plot, cols_labels_dict, title='Comparison of 4-month MA (normalized)'):
+
+    fig2, ax2 = plt.subplots(figsize=(14, 8))
+
+    for col in cols_to_plot:
+    
+        ax2.plot(dates, df[col], 
+                 label=cols_labels_dict[col], 
+                 linewidth=2.5)
+    
+    ax2.set_title(title, fontsize=16, fontweight='bold')
+    ax2.set_xlabel('Date', fontsize=12, fontweight='bold')
+    ax2.set_ylabel('Normalized sentiments', fontsize=12, fontweight='bold')
+    ax2.legend(loc='best')
+    ax2.grid(True, alpha=0.3)
+    
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    plt.show()
+
+    return fig2
     
 # mask = np.triu(np.ones_like(corr_matrix, dtype=bool))
 
